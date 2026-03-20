@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
 import {
@@ -82,6 +82,29 @@ export default function App() {
   const [pageCount, setPageCount] = useState(0);
   const [applying, setApplying] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const pdfUrlRef = useRef<string | null>(null);
+
+  // ── PDF preview helper ─────────────────────────────────────────────────────
+  const compilePdfPreview = async (latex: string) => {
+    setPreviewLoading(true);
+    try {
+      const fd = new FormData();
+      fd.append('latexBody', latex);
+      const res = await fetch('/api/compile-preview', { method: 'POST', body: fd });
+      if (!res.ok) return;
+      const count = parseInt(res.headers.get('X-Page-Count') ?? '1', 10);
+      setPageCount(count);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      if (pdfUrlRef.current) URL.revokeObjectURL(pdfUrlRef.current);
+      pdfUrlRef.current = url;
+      setPdfUrl(url);
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
 
   // ── Upload handlers ────────────────────────────────────────────────────────
   const handleFileChange = useCallback((file: File | null) => {
@@ -112,9 +135,11 @@ export default function App() {
       if (!res.ok) throw new Error(data.detail || 'Analysis failed');
       setAnalysis(data.analysis ?? '');
       setResumeText(data.resumeText ?? '');
-      setLatexBody(data.latexBody ?? '');
+      const latex = data.latexBody ?? '';
+      setLatexBody(latex);
       setPageCount(0);
       setView('editor');
+      compilePdfPreview(latex);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Unexpected error');
     } finally {
@@ -133,8 +158,10 @@ export default function App() {
       const res = await fetch('/api/apply-changes', { method: 'POST', body: fd });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Failed to apply changes');
-      setLatexBody(data.latexBody ?? '');
+      const latex = data.latexBody ?? '';
+      setLatexBody(latex);
       setPageCount(data.pageCount ?? 0);
+      compilePdfPreview(latex);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Unexpected error');
     } finally {
@@ -172,6 +199,8 @@ export default function App() {
   };
 
   const handleReset = () => {
+    if (pdfUrlRef.current) { URL.revokeObjectURL(pdfUrlRef.current); pdfUrlRef.current = null; }
+    setPdfUrl(null);
     setView('upload');
     setResumeFile(null);
     setJobDescription('');
@@ -416,67 +445,119 @@ export default function App() {
           </Button>
         </Box>
 
-        {/* Split pane */}
-        <Box sx={{ flex: 1, display: 'flex', minHeight: 0 }}>
+        {/* Main content: top row (editor + pdf) + bottom (analysis) */}
+        <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
 
-          {/* Left — LaTeX editor */}
-          <Box sx={{
-            width: '55%',
-            minHeight: 0,
-            display: 'flex',
-            flexDirection: 'column',
-            borderRight: '1px solid #e2e8f0',
-          }}>
-            {/* Editor header */}
+          {/* Top row */}
+          <Box sx={{ flex: '0 0 62%', display: 'flex', minHeight: 0, borderBottom: '1px solid #e2e8f0' }}>
+
+            {/* Left — LaTeX editor */}
             <Box sx={{
-              flexShrink: 0,
-              px: 2, py: 1,
-              bgcolor: '#f1f5f9',
-              borderBottom: '1px solid #e2e8f0',
-              display: 'flex', alignItems: 'center', gap: 1,
+              width: '50%',
+              minHeight: 0,
+              display: 'flex',
+              flexDirection: 'column',
+              borderRight: '1px solid #e2e8f0',
             }}>
-              <Box sx={{ width: 10, height: 10, borderRadius: '50%', bgcolor: '#fc5c65' }} />
-              <Box sx={{ width: 10, height: 10, borderRadius: '50%', bgcolor: '#fd9644' }} />
-              <Box sx={{ width: 10, height: 10, borderRadius: '50%', bgcolor: '#26de81' }} />
-              <Typography variant="caption" color="text.secondary" sx={{ ml: 1, fontFamily: 'monospace' }}>
-                resume.tex
-              </Typography>
+              {/* Editor header */}
+              <Box sx={{
+                flexShrink: 0,
+                px: 2, py: 1,
+                bgcolor: '#f1f5f9',
+                borderBottom: '1px solid #e2e8f0',
+                display: 'flex', alignItems: 'center', gap: 1,
+              }}>
+                <Box sx={{ width: 10, height: 10, borderRadius: '50%', bgcolor: '#fc5c65' }} />
+                <Box sx={{ width: 10, height: 10, borderRadius: '50%', bgcolor: '#fd9644' }} />
+                <Box sx={{ width: 10, height: 10, borderRadius: '50%', bgcolor: '#26de81' }} />
+                <Typography variant="caption" color="text.secondary" sx={{ ml: 1, fontFamily: 'monospace' }}>
+                  resume.tex
+                </Typography>
+              </Box>
+
+              <Box sx={{ flex: 1, minHeight: 0 }}>
+                <Editor
+                  height="100%"
+                  language="latex"
+                  theme="vs"
+                  value={latexBody}
+                  onChange={(val) => setLatexBody(val ?? '')}
+                  options={{
+                    fontSize: 13,
+                    fontFamily: '"Fira Code", "Cascadia Code", monospace',
+                    minimap: { enabled: false },
+                    wordWrap: 'on',
+                    scrollBeyondLastLine: false,
+                    lineNumbers: 'on',
+                    renderLineHighlight: 'line',
+                    padding: { top: 12, bottom: 12 },
+                    smoothScrolling: true,
+                  }}
+                />
+              </Box>
             </Box>
 
-            <Box sx={{ flex: 1, minHeight: 0 }}>
-              <Editor
-                height="100%"
-                language="latex"
-                theme="vs"
-                value={latexBody}
-                onChange={(val) => setLatexBody(val ?? '')}
-                options={{
-                  fontSize: 13,
-                  fontFamily: '"Fira Code", "Cascadia Code", monospace',
-                  minimap: { enabled: false },
-                  wordWrap: 'on',
-                  scrollBeyondLastLine: false,
-                  lineNumbers: 'on',
-                  renderLineHighlight: 'line',
-                  padding: { top: 12, bottom: 12 },
-                  smoothScrolling: true,
-                }}
-              />
+            {/* Right — PDF preview */}
+            <Box sx={{
+              width: '50%',
+              minHeight: 0,
+              display: 'flex',
+              flexDirection: 'column',
+              bgcolor: '#f8fafc',
+            }}>
+              {/* PDF header */}
+              <Box sx={{
+                flexShrink: 0,
+                px: 2, py: 1,
+                bgcolor: '#f1f5f9',
+                borderBottom: '1px solid #e2e8f0',
+                display: 'flex', alignItems: 'center', gap: 1.5,
+              }}>
+                <PdfIcon sx={{ fontSize: 16, color: '#dc2626' }} />
+                <Typography variant="caption" color="text.secondary" sx={{ fontFamily: 'monospace' }}>
+                  resume.pdf — preview
+                </Typography>
+                {previewLoading && <CircularProgress size={12} sx={{ ml: 'auto' }} />}
+              </Box>
+
+              {/* PDF iframe or placeholder */}
+              <Box sx={{ flex: 1, minHeight: 0, position: 'relative' }}>
+                {pdfUrl ? (
+                  <iframe
+                    src={pdfUrl}
+                    title="PDF Preview"
+                    style={{ width: '100%', height: '100%', border: 'none', display: 'block' }}
+                  />
+                ) : (
+                  <Box sx={{
+                    height: '100%', display: 'flex', flexDirection: 'column',
+                    alignItems: 'center', justifyContent: 'center', gap: 1.5, color: '#94a3b8',
+                  }}>
+                    {previewLoading ? (
+                      <>
+                        <CircularProgress size={32} color="inherit" />
+                        <Typography variant="body2" color="inherit">Compiling preview...</Typography>
+                      </>
+                    ) : (
+                      <>
+                        <PdfIcon sx={{ fontSize: 40 }} />
+                        <Typography variant="body2" color="inherit">PDF preview will appear here</Typography>
+                      </>
+                    )}
+                  </Box>
+                )}
+              </Box>
             </Box>
+
           </Box>
 
-          {/* Right — Analysis panel */}
-          <Box sx={{
-            width: '45%',
-            minHeight: 0,
-            display: 'flex',
-            flexDirection: 'column',
-            bgcolor: 'white',
-          }}>
+          {/* Bottom — Analysis results */}
+          <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, bgcolor: 'white' }}>
+
             {/* Panel header */}
             <Box sx={{
               flexShrink: 0,
-              px: 3, py: 1.5,
+              px: 3, py: 1,
               bgcolor: '#f8fafc',
               borderBottom: '1px solid #e2e8f0',
               display: 'flex', alignItems: 'center', gap: 1.5,
@@ -485,6 +566,11 @@ export default function App() {
               <Typography variant="subtitle2" fontWeight={700} color="text.primary">
                 Analysis Results
               </Typography>
+              <Box flex={1} />
+              <WarnIcon sx={{ fontSize: 14, color: '#d97706' }} />
+              <Typography variant="caption" color="#92400e" lineHeight={1.5}>
+                Edit LaTeX → <strong>Download PDF</strong> &nbsp;|&nbsp; <strong>Apply AI Changes</strong> to auto-incorporate recommendations
+              </Typography>
             </Box>
 
             {/* Analysis content */}
@@ -492,25 +578,25 @@ export default function App() {
               flex: 1,
               overflow: 'auto',
               px: 3,
-              py: 2,
+              py: 1.5,
               '& h2': {
-                fontSize: '0.95rem',
+                fontSize: '0.875rem',
                 fontWeight: 700,
                 color: '#1e40af',
-                mt: 2.5,
-                mb: 0.75,
+                mt: 2,
+                mb: 0.5,
                 pb: 0.5,
                 borderBottom: '2px solid #dbeafe',
                 '&:first-of-type': { mt: 0 },
               },
-              '& p': { fontSize: '0.875rem', lineHeight: 1.75, color: '#334155', mb: 1 },
-              '& ul, & ol': { pl: 2.5, mb: 1.5 },
-              '& li': { fontSize: '0.875rem', lineHeight: 1.7, color: '#334155', mb: 0.25 },
+              '& p': { fontSize: '0.8rem', lineHeight: 1.7, color: '#334155', mb: 0.75 },
+              '& ul, & ol': { pl: 2.5, mb: 1 },
+              '& li': { fontSize: '0.8rem', lineHeight: 1.65, color: '#334155', mb: 0.2 },
               '& strong': { color: '#0f172a', fontWeight: 600 },
             }}>
               {applying ? (
-                <Box display="flex" flexDirection="column" alignItems="center" justifyContent="center" height="100%" gap={2}>
-                  <CircularProgress size={36} />
+                <Box display="flex" alignItems="center" gap={2} height="100%">
+                  <CircularProgress size={24} />
                   <Typography variant="body2" color="text.secondary">
                     Applying improvements to your resume...
                   </Typography>
@@ -520,20 +606,6 @@ export default function App() {
               )}
             </Box>
 
-            {/* Bottom tip */}
-            <Box sx={{
-              flexShrink: 0,
-              px: 3, py: 1.5,
-              bgcolor: '#fffbeb',
-              borderTop: '1px solid #fef3c7',
-              display: 'flex', alignItems: 'flex-start', gap: 1,
-            }}>
-              <WarnIcon sx={{ fontSize: 16, color: '#d97706', mt: 0.1 }} />
-              <Typography variant="caption" color="#92400e" lineHeight={1.5}>
-                Edit the LaTeX directly, then click <strong>Download PDF</strong> to compile and export.
-                Use <strong>Apply AI Changes</strong> to automatically incorporate the recommendations above.
-              </Typography>
-            </Box>
           </Box>
 
         </Box>
