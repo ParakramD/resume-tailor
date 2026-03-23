@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
 import {
@@ -87,7 +87,7 @@ export default function App() {
   const pdfUrlRef = useRef<string | null>(null);
 
   // ── PDF preview helper ─────────────────────────────────────────────────────
-  const compilePdfPreview = async (latex: string) => {
+  const compilePdfPreview = useCallback(async (latex: string) => {
     setPreviewLoading(true);
     try {
       const fd = new FormData();
@@ -104,7 +104,14 @@ export default function App() {
     } finally {
       setPreviewLoading(false);
     }
-  };
+  }, []);
+
+  // ── Live preview: recompile 1.5 s after the user stops typing ─────────────
+  useEffect(() => {
+    if (!latexBody || view !== 'editor') return;
+    const timer = setTimeout(() => compilePdfPreview(latexBody), 1500);
+    return () => clearTimeout(timer);
+  }, [latexBody, view, compilePdfPreview]);
 
   // ── Upload handlers ────────────────────────────────────────────────────────
   const handleFileChange = useCallback((file: File | null) => {
@@ -524,6 +531,7 @@ export default function App() {
               <Box sx={{ flex: 1, minHeight: 0, position: 'relative' }}>
                 {pdfUrl ? (
                   <iframe
+                    key={pdfUrl}
                     src={pdfUrl}
                     title="PDF Preview"
                     style={{ width: '100%', height: '100%', border: 'none', display: 'block' }}
