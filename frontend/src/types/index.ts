@@ -1,5 +1,18 @@
 export type View = 'upload' | 'editor';
 
+export interface User {
+  id: number;
+  name: string;
+  email: string;
+}
+
+export interface SavedResume {
+  id: number;
+  filename: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ResumeHeader {
   name: string;
   phone: string;

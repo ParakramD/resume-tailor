@@ -1,20 +1,31 @@
 import { useState } from 'react';
 import {
   Box, Typography, Paper, TextField, Button, Alert, CircularProgress, LinearProgress,
-  ToggleButton, ToggleButtonGroup,
+  ToggleButton, ToggleButtonGroup, Stack, MenuItem,
 } from '@mui/material';
 import {
   Analytics as AnalyticsIcon, Work as WorkIcon,
   UploadFile as UploadIcon, Code as CodeIcon, ArrowForward as ArrowIcon,
+  AccountCircle as AccountIcon, Logout as LogoutIcon, FolderOpen as SavedIcon,
 } from '@mui/icons-material';
 import FileDropzone from '../components/upload/FileDropzone';
+import type { SavedResume, User } from '../types';
 
 interface Props {
+  currentUser: User | null;
+  authLoading: boolean;
+  savedResumes: SavedResume[];
+  selectedSavedResumeId: number | null;
   resumeFile: File | null;
   jobDescription: string;
   isDragOver: boolean;
   loading: boolean;
   error: string;
+  onLogin: (email: string, password: string) => Promise<void>;
+  onRegister: (name: string, email: string, password: string) => Promise<void>;
+  onLogout: () => Promise<void>;
+  onSaveResume: () => Promise<void>;
+  onSavedResumeChange: (id: number | null) => void;
   onFileChange: (file: File | null) => void;
   onDrop: (e: React.DragEvent<HTMLDivElement>) => void;
   onDragOver: (e: React.DragEvent<HTMLDivElement>) => void;
@@ -25,12 +36,49 @@ interface Props {
 }
 
 export default function UploadPage({
+  currentUser, authLoading, savedResumes, selectedSavedResumeId,
   resumeFile, jobDescription, isDragOver, loading, error,
+  onLogin, onRegister, onLogout, onSaveResume, onSavedResumeChange,
   onFileChange, onDrop, onDragOver, onDragLeave,
   onJobDescriptionChange, onAnalyze, onPasteLatex,
 }: Props) {
   const [mode, setMode] = useState<'upload' | 'paste'>('upload');
   const [pastedLatex, setPastedLatex] = useState('');
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [saveLoading, setSaveLoading] = useState(false);
+  const [saveMessage, setSaveMessage] = useState('');
+
+  const handleAuthSubmit = async () => {
+    setAuthError('');
+    try {
+      if (authMode === 'register') {
+        await onRegister(name, email, password);
+      } else {
+        await onLogin(email, password);
+      }
+      setPassword('');
+    } catch (err: unknown) {
+      setAuthError(err instanceof Error ? err.message : 'Authentication failed');
+    }
+  };
+
+  const handleSaveResume = async () => {
+    setAuthError('');
+    setSaveMessage('');
+    setSaveLoading(true);
+    try {
+      await onSaveResume();
+      setSaveMessage('Resume saved successfully.');
+    } catch (err: unknown) {
+      setAuthError(err instanceof Error ? err.message : 'Failed to save resume');
+    } finally {
+      setSaveLoading(false);
+    }
+  };
 
   return (
     <Box sx={{
@@ -52,6 +100,122 @@ export default function UploadPage({
             Upload your resume and job description for AI-powered recommendations
           </Typography>
         </Box>
+
+        <Paper elevation={0} sx={{ border: '1px solid', borderColor: '#e2e8f0', borderRadius: 3, overflow: 'hidden', mb: 3 }}>
+          <Box sx={{ p: 3, borderBottom: currentUser ? '1px solid #e2e8f0' : 'none' }}>
+            <Box display="flex" alignItems="center" gap={1.5} mb={2}>
+              <AccountIcon color="primary" />
+              <Typography variant="h6">Login & Resume Storage</Typography>
+            </Box>
+
+            {currentUser ? (
+              <Box display="flex" alignItems="center" justifyContent="space-between" gap={2} flexWrap="wrap">
+                <Box>
+                  <Typography variant="body1" fontWeight={600}>{currentUser.name}</Typography>
+                  <Typography variant="body2" color="text.secondary">{currentUser.email}</Typography>
+                </Box>
+                <Button
+                  variant="outlined"
+                  color="inherit"
+                  startIcon={<LogoutIcon />}
+                  onClick={onLogout}
+                  disabled={authLoading}
+                >
+                  Log out
+                </Button>
+              </Box>
+            ) : (
+              <Stack spacing={2}>
+                <ToggleButtonGroup
+                  exclusive value={authMode}
+                  onChange={(_, v) => v && setAuthMode(v)}
+                  size="small"
+                  sx={{
+                    alignSelf: 'flex-start',
+                    '& .MuiToggleButton-root': {
+                      px: 2, py: 0.75, fontSize: '0.85rem', textTransform: 'none',
+                    },
+                  }}
+                >
+                  <ToggleButton value="login">Login</ToggleButton>
+                  <ToggleButton value="register">Create account</ToggleButton>
+                </ToggleButtonGroup>
+
+                {authMode === 'register' && (
+                  <TextField
+                    label="Name"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    fullWidth
+                  />
+                )}
+                <TextField
+                  label="Email"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  fullWidth
+                />
+                <TextField
+                  label="Password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  fullWidth
+                />
+                {authError && <Alert severity="error">{authError}</Alert>}
+                <Button
+                  variant="contained"
+                  onClick={handleAuthSubmit}
+                  disabled={authLoading || !email.trim() || !password.trim() || (authMode === 'register' && !name.trim())}
+                  startIcon={authLoading ? <CircularProgress size={18} color="inherit" /> : <AccountIcon />}
+                  sx={{
+                    alignSelf: 'flex-start',
+                    background: 'linear-gradient(90deg, #2563eb 0%, #7c3aed 100%)',
+                    '&:hover': { background: 'linear-gradient(90deg, #1d4ed8 0%, #6d28d9 100%)' },
+                  }}
+                >
+                  {authMode === 'register' ? 'Create Account' : 'Login'}
+                </Button>
+              </Stack>
+            )}
+          </Box>
+
+          {currentUser && (
+            <Box sx={{ p: 3 }}>
+              <Box display="flex" alignItems="center" gap={1.5} mb={2}>
+                <SavedIcon color="secondary" />
+                <Typography variant="subtitle1" fontWeight={600}>Saved Resumes</Typography>
+              </Box>
+              <TextField
+                select
+                fullWidth
+                value={selectedSavedResumeId ?? ''}
+                onChange={(e) => onSavedResumeChange(e.target.value ? Number(e.target.value) : null)}
+                SelectProps={{ displayEmpty: true }}
+                sx={{
+                  '& .MuiOutlinedInput-root': {
+                    bgcolor: '#f8fafc',
+                  },
+                }}
+              >
+                <MenuItem value="">
+                  <em>Upload a new PDF for this analysis</em>
+                </MenuItem>
+                {savedResumes.map((savedResume) => (
+                  <MenuItem key={savedResume.id} value={savedResume.id}>
+                    {savedResume.filename}
+                  </MenuItem>
+                ))}
+              </TextField>
+              <Typography variant="caption" color="text.secondary" mt={1} display="block">
+                {savedResumes.length > 0
+                  ? 'Choose a saved resume to skip re-uploading, or leave this empty to use a new PDF.'
+                  : 'Your saved resumes will show up here after you analyze an uploaded PDF while logged in.'}
+              </Typography>
+            </Box>
+          )}
+        </Paper>
 
         {/* Mode toggle */}
         <Box display="flex" justifyContent="center" mb={3}>
@@ -99,6 +263,23 @@ export default function UploadPage({
                 onDragOver={onDragOver}
                 onDragLeave={onDragLeave}
               />
+              {currentUser && (
+                <Box mt={2}>
+                  <Button
+                    variant="outlined"
+                    onClick={handleSaveResume}
+                    disabled={saveLoading || !resumeFile}
+                    startIcon={saveLoading ? <CircularProgress size={16} color="inherit" /> : <SavedIcon />}
+                  >
+                    {saveLoading ? 'Saving...' : 'Save Resume'}
+                  </Button>
+                  {saveMessage && (
+                    <Typography variant="caption" color="success.main" display="block" mt={1}>
+                      {saveMessage}
+                    </Typography>
+                  )}
+                </Box>
+              )}
             </Box>
 
             {/* Step 2 */}
@@ -137,7 +318,7 @@ export default function UploadPage({
               <Button
                 variant="contained" fullWidth size="large"
                 onClick={onAnalyze}
-                disabled={loading || !resumeFile || !jobDescription.trim()}
+                disabled={loading || (!resumeFile && !selectedSavedResumeId) || !jobDescription.trim()}
                 startIcon={loading ? <CircularProgress size={18} color="inherit" /> : <AnalyticsIcon />}
                 sx={{
                   py: 1.5, fontSize: '1rem',

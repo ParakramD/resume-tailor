@@ -2,13 +2,19 @@ import io
 import json
 import os
 import re
+import secrets
+import sqlite3
 import subprocess
 import tempfile
+from base64 import b64decode, b64encode
+from datetime import datetime, timezone
+from hashlib import pbkdf2_hmac
+from pathlib import Path
 
 import fitz  # PyMuPDF
 import pytesseract
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from openai import OpenAI
@@ -21,7 +27,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[os.getenv("CORS_ORIGIN", "http://localhost:5173")],
-    allow_methods=["POST"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["X-Page-Count"],
 )
@@ -32,6 +38,8 @@ deepseek = OpenAI(
 )
 
 MAX_PDF_BYTES = 20 * 1024 * 1024  # 20 MB
+DATA_DIR = Path(__file__).resolve().parent / "data"
+DB_PATH = DATA_DIR / "app.db"
 
 # ---------------------------------------------------------------------------
 # Jake Gutierrez SWE resume template preamble (fixed — never sent to LLM)
@@ -461,28 +469,267 @@ def generate_latex_body(resume_text: str, improvements: str | None = None) -> st
     return strip_fences(response.choices[0].message.content or "")
 
 
+def get_db() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with get_db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password_salt TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS resumes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                pdf_base64 TEXT NOT NULL,
+                extracted_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, filename),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            """
+        )
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def hash_password(password: str, salt: bytes) -> bytes:
+    return pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+
+
+def parse_bearer_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
+def serialize_user(user: sqlite3.Row | dict) -> dict:
+    return {
+        "id": int(user["id"]),
+        "name": str(user["name"]),
+        "email": str(user["email"]),
+    }
+
+
+def get_authenticated_user(authorization: str | None) -> sqlite3.Row:
+    token = parse_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT users.id, users.name, users.email, users.created_at
+            FROM sessions
+            JOIN users ON users.id = sessions.user_id
+            WHERE sessions.token = ?
+            """,
+            (token,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    return row
+
+
+def get_optional_authenticated_user(authorization: str | None) -> sqlite3.Row | None:
+    token = parse_bearer_token(authorization)
+    if not token:
+        return None
+
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT users.id, users.name, users.email, users.created_at
+            FROM sessions
+            JOIN users ON users.id = sessions.user_id
+            WHERE sessions.token = ?
+            """,
+            (token,),
+        ).fetchone()
+
+    return row
+
+
+def upsert_resume_for_user(
+    *,
+    user_id: int,
+    filename: str,
+    content_type: str,
+    pdf_bytes: bytes,
+    extracted_text: str,
+) -> int:
+    encoded_pdf = b64encode(pdf_bytes).decode("ascii")
+    now = utc_now_iso()
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM resumes WHERE user_id = ? AND filename = ?",
+            (user_id, filename),
+        ).fetchone()
+        if existing is None:
+            cur = conn.execute(
+                """
+                INSERT INTO resumes (
+                    user_id, filename, content_type, pdf_base64, extracted_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, filename, content_type, encoded_pdf, extracted_text, now, now),
+            )
+            return int(cur.lastrowid)
+
+        conn.execute(
+            """
+            UPDATE resumes
+            SET content_type = ?, pdf_base64 = ?, extracted_text = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (content_type, encoded_pdf, extracted_text, now, int(existing["id"])),
+        )
+        return int(existing["id"])
+
+
+async def resolve_resume_for_analysis(
+    *,
+    resume: UploadFile | None,
+    saved_resume_id_raw: str,
+    current_user: sqlite3.Row | None,
+) -> tuple[bytes, str, str, str]:
+    pdf_bytes: bytes | None = None
+    resume_filename = "resume.pdf"
+    resume_content_type = "application/pdf"
+    cached_resume_text = ""
+
+    if saved_resume_id_raw.strip():
+        if current_user is None:
+            raise HTTPException(status_code=401, detail="Please log in to use saved resumes")
+        try:
+            saved_resume_id = int(saved_resume_id_raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid saved resume id") from exc
+
+        with get_db() as conn:
+            saved_resume = conn.execute(
+                """
+                SELECT id, filename, content_type, pdf_base64, extracted_text
+                FROM resumes
+                WHERE id = ? AND user_id = ?
+                """,
+                (saved_resume_id, int(current_user["id"])),
+            ).fetchone()
+
+        if saved_resume is None:
+            raise HTTPException(status_code=404, detail="Saved resume not found")
+
+        pdf_bytes = b64decode(saved_resume["pdf_base64"])
+        resume_filename = str(saved_resume["filename"])
+        resume_content_type = str(saved_resume["content_type"] or "application/pdf")
+        cached_resume_text = str(saved_resume["extracted_text"] or "")
+    else:
+        pdf_bytes, resume_filename, resume_content_type = await read_uploaded_resume(resume)
+
+    if pdf_bytes is None:
+        raise HTTPException(status_code=400, detail="Resume PDF is required")
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        raise HTTPException(status_code=400, detail="File too large (max 20 MB)")
+
+    return pdf_bytes, resume_filename, resume_content_type, cached_resume_text
+
+
+async def read_uploaded_resume(
+    resume: UploadFile | None,
+) -> tuple[bytes, str, str]:
+    if resume is None:
+        raise HTTPException(status_code=400, detail="Please upload a resume PDF or choose a saved resume")
+    if resume.content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+    pdf_bytes = await resume.read()
+    return pdf_bytes, resume.filename or "resume.pdf", resume.content_type or "application/pdf"
+
+
+def store_resume_if_needed(
+    *,
+    current_user: sqlite3.Row | None,
+    saved_resume_id_raw: str,
+    save_resume_raw: str,
+    resume_filename: str,
+    resume_content_type: str,
+    pdf_bytes: bytes,
+    resume_text: str,
+) -> int | None:
+    if current_user is None:
+        return None
+    if not (saved_resume_id_raw.strip() or save_resume_raw.strip().lower() == "true"):
+        return None
+
+    return upsert_resume_for_user(
+        user_id=int(current_user["id"]),
+        filename=resume_filename,
+        content_type=resume_content_type,
+        pdf_bytes=pdf_bytes,
+        extracted_text=resume_text,
+    )
+
+
+init_db()
+
+
 # ---------------------------------------------------------------------------
 # POST /api/analyze
 # ---------------------------------------------------------------------------
 @app.post("/api/analyze")
 async def analyze_resume(
-    resume: UploadFile = File(...),
+    resume: UploadFile | None = File(default=None),
     jobDescription: str = Form(...),
+    savedResumeId: str = Form(default=""),
+    saveResume: str = Form(default="false"),
+    authorization: str | None = Header(default=None),
 ):
-    if resume.content_type not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
     if not jobDescription.strip():
         raise HTTPException(status_code=400, detail="Job description is required")
 
-    pdf_bytes = await resume.read()
-    if len(pdf_bytes) > MAX_PDF_BYTES:
-        raise HTTPException(status_code=400, detail="File too large (max 20 MB)")
+    current_user = get_optional_authenticated_user(authorization)
+    pdf_bytes, resume_filename, resume_content_type, cached_resume_text = await resolve_resume_for_analysis(
+        resume=resume,
+        saved_resume_id_raw=savedResumeId,
+        current_user=current_user,
+    )
 
-    print("[1/3] Extracting text from PDF...")
-    try:
-        resume_text = extract_text(pdf_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Failed to read PDF: {e}") from e
+    if cached_resume_text.strip():
+        print("[1/3] Using stored resume text...")
+        resume_text = cached_resume_text
+    else:
+        print("[1/3] Extracting text from PDF...")
+        try:
+            resume_text = extract_text(pdf_bytes)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Failed to read PDF: {e}") from e
 
     if not resume_text.strip():
         raise HTTPException(status_code=422, detail="Could not extract text from the PDF.")
@@ -508,7 +755,23 @@ async def analyze_resume(
         resume_data = f_struct.result()
     print("[stage2] Done")
 
-    return {"analysis": analysis, "resumeText": resume_text, "latexBody": latex_body, "resumeData": resume_data}
+    saved_resume_id = store_resume_if_needed(
+        current_user=current_user,
+        saved_resume_id_raw=savedResumeId,
+        save_resume_raw=saveResume,
+        resume_filename=resume_filename,
+        resume_content_type=resume_content_type,
+        pdf_bytes=pdf_bytes,
+        resume_text=resume_text,
+    )
+
+    return {
+        "analysis": analysis,
+        "resumeText": resume_text,
+        "latexBody": latex_body,
+        "resumeData": resume_data,
+        "savedResumeId": saved_resume_id,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -673,3 +936,185 @@ async def apply_changes(
 
     print(f"[1/1] Done — {page_count} page(s)")
     return {"latexBody": body, "pageCount": page_count}
+
+
+# ---------------------------------------------------------------------------
+# Auth + Resume Storage
+# ---------------------------------------------------------------------------
+@app.post("/api/auth/register")
+async def register(
+    name: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(...),
+):
+    normalized_name = name.strip()
+    normalized_email = email.strip().lower()
+    if not normalized_name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    if not normalized_email:
+        raise HTTPException(status_code=400, detail="Email is required")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    password_salt = secrets.token_bytes(16)
+    password_hash = hash_password(password, password_salt)
+    now = utc_now_iso()
+
+    try:
+        with get_db() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO users (name, email, password_salt, password_hash, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_name,
+                    normalized_email,
+                    password_salt.hex(),
+                    password_hash.hex(),
+                    now,
+                ),
+            )
+            user_id = int(cur.lastrowid)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="An account with that email already exists") from exc
+
+    token = secrets.token_urlsafe(32)
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)",
+            (token, user_id, now),
+        )
+
+    return {
+        "token": token,
+        "user": {
+            "id": user_id,
+            "name": normalized_name,
+            "email": normalized_email,
+        },
+    }
+
+
+@app.post("/api/auth/login")
+async def login(
+    email: str = Form(...),
+    password: str = Form(...),
+):
+    normalized_email = email.strip().lower()
+    if not normalized_email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required")
+
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, name, email, password_salt, password_hash
+            FROM users
+            WHERE email = ?
+            """,
+            (normalized_email,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    expected_hash = bytes.fromhex(str(row["password_hash"]))
+    supplied_hash = hash_password(password, bytes.fromhex(str(row["password_salt"])))
+    if supplied_hash != expected_hash:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = secrets.token_urlsafe(32)
+    now = utc_now_iso()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)",
+            (token, int(row["id"]), now),
+        )
+
+    return {
+        "token": token,
+        "user": {
+            "id": int(row["id"]),
+            "name": str(row["name"]),
+            "email": str(row["email"]),
+        },
+    }
+
+
+@app.get("/api/auth/me")
+async def me(authorization: str | None = Header(default=None)):
+    user = get_authenticated_user(authorization)
+    return {
+        "user": {
+            "id": int(user["id"]),
+            "name": str(user["name"]),
+            "email": str(user["email"]),
+        }
+    }
+
+
+@app.post("/api/auth/logout")
+async def logout(authorization: str | None = Header(default=None)):
+    token = parse_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    with get_db() as conn:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    return {"success": True}
+
+
+@app.get("/api/resumes")
+async def list_resumes(authorization: str | None = Header(default=None)):
+    user = get_authenticated_user(authorization)
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, filename, created_at, updated_at
+            FROM resumes
+            WHERE user_id = ?
+            ORDER BY updated_at DESC, id DESC
+            """,
+            (int(user["id"]),),
+        ).fetchall()
+
+    return {
+        "resumes": [
+            {
+                "id": int(row["id"]),
+                "filename": str(row["filename"]),
+                "createdAt": str(row["created_at"]),
+                "updatedAt": str(row["updated_at"]),
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/api/resumes")
+async def save_resume(
+    resume: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    user = get_authenticated_user(authorization)
+    if resume.content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+    pdf_bytes = await resume.read()
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        raise HTTPException(status_code=400, detail="File too large (max 20 MB)")
+
+    try:
+        extracted_text = extract_text(pdf_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Failed to read PDF: {e}") from e
+
+    resume_id = upsert_resume_for_user(
+        user_id=int(user["id"]),
+        filename=resume.filename or "resume.pdf",
+        content_type=resume.content_type or "application/pdf",
+        pdf_bytes=pdf_bytes,
+        extracted_text=extracted_text,
+    )
+
+    return {"id": resume_id, "filename": resume.filename or "resume.pdf"}
